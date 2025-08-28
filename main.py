@@ -22,7 +22,6 @@ class PokeSpider(scrapy.Spider):
         "RETRY_TIMES": 3,
     }
 
-    # ========== INDEX ==========
     def parse(self, response):
         for row in response.css("table#pokedex tbody tr"):
             href = row.css("td.cell-name a.ent-name::attr(href)").get()
@@ -32,20 +31,17 @@ class PokeSpider(scrapy.Spider):
                     href,
                     callback=self.parse_pokemon,
                     cb_kwargs={"form_hint": form_hint},
-                    dont_filter=True,  # visita mesmo URLs repetidas (uma por linha/forma)
+                    dont_filter=True, 
                 )
 
-    # ========== POKÉMON DETALHE ==========
     def parse_pokemon(self, response, form_hint):
         url_pokemon = response.url
         nome = (response.css("h1::text").get() or "").strip()
 
-        # vitals-table apenas de Pokédex data (tem "National")
         pokedex_tables = response.xpath(
             "//table[contains(@class,'vitals-table')][.//tr[th[contains(normalize-space(),'National')]]]"
         )
 
-        # tenta casar por forma; fallback = primeira tabela de Pokédex data
         table = None
         for t in pokedex_tables:
             small = t.xpath("normalize-space(preceding-sibling::h2[1]//small/text())").get()
@@ -57,7 +53,6 @@ class PokeSpider(scrapy.Spider):
         if table is None and pokedex_tables:
             table = pokedex_tables[0]
 
-        # básicos
         if table is not None:
             num_nat = table.xpath(
                 ".//tr[th[contains(normalize-space(),'National')]]/td//strong/text()"
@@ -72,13 +67,10 @@ class PokeSpider(scrapy.Spider):
         else:
             num_nat, tamanho, peso, tipos = "", "", "", ""
 
-        # efetividade robusta
         efetividade = self._extract_effectiveness(response)
 
-        # próximas evoluções (apenas depois do atual)
         proximas_evolucoes = self._next_evolutions(response, nome)
 
-        # habilidades (link + descrição)
         hab_nomes = table.xpath(".//tr[th[normalize-space()='Abilities']]/td//a/text()").getall() if table is not None else []
         hab_urls = [response.urljoin(u) for u in table.xpath(
             ".//tr[th[normalize-space()='Abilities']]/td//a/@href"
@@ -110,7 +102,6 @@ class PokeSpider(scrapy.Spider):
                 dont_filter=True,
             )
 
-    # ========== HABILIDADE ==========
     def parse_ability(self, response, item, hab_nome):
         descricao = self._extract_ability_description(response)
         item["habilidades"].append({
@@ -140,7 +131,6 @@ class PokeSpider(scrapy.Spider):
             item.pop("_pending", None)
             yield item
 
-    # ---------- helpers ----------
     @staticmethod
     def _match_form(label, form_hint):
         """Compara 'Attack Forme' vs 'Attack Form', ignora caixa/hífens."""
@@ -153,7 +143,7 @@ class PokeSpider(scrapy.Spider):
 
     def _next_evolutions(self, response, nome_atual):
         """Retorna evoluções após o Pokémon atual."""
-        cards = response.css("div.infocard-list-evo > *")  # alterna: card, seta, card...
+        cards = response.css("div.infocard-list-evo > *")
         seq = []
         for i in range(0, len(cards), 2):
             card = cards[i]
@@ -177,7 +167,6 @@ class PokeSpider(scrapy.Spider):
                     step["level_item"] = txt.strip("()")
             seq.append(step)
 
-        # posição do atual
         idx = None
         for i, s in enumerate(seq):
             if s["nome"] and nome_atual and s["nome"].strip().lower() == nome_atual.strip().lower():
@@ -186,7 +175,6 @@ class PokeSpider(scrapy.Spider):
         if idx is None:
             return []
 
-        # só o que vem depois
         proximos = []
         for j in range(idx + 1, len(seq)):
             s = seq[j]
@@ -199,13 +187,11 @@ class PokeSpider(scrapy.Spider):
             })
         return proximos
 
-    # -------- efetividade (robusto) --------
     def _extract_effectiveness(self, response):
         table = self._find_effectiveness_table(response)
         if not table:
             return {}
 
-        # headers
         headers = table.xpath(".//thead//th[not(contains(@class,'cell-total'))]")
         if not headers:
             headers = table.xpath(".//tr[1]/th[not(contains(@class,'cell-total'))]")
@@ -222,7 +208,6 @@ class PokeSpider(scrapy.Spider):
             if t:
                 tipos.append(t)
 
-        # valores (primeira linha)
         cells = table.xpath(".//tbody/tr[1]/td")
         if not cells:
             cells = table.xpath(".//tr[position()=2]/td")
@@ -248,14 +233,12 @@ class PokeSpider(scrapy.Spider):
         cand = response.xpath("(//table[contains(@class,'type-table')])[1]")
         return cand[0] if cand else None
 
-    # -------- habilidade: descrição (robusto) --------
     def _extract_ability_description(self, response) -> str:
         """
         Prioriza a seção 'Effect' (um ou mais <p> até o próximo <h2>).
         Fallback: primeiro <p> do conteúdo.
         Fallback2: primeira célula da tabela 'Game descriptions'.
         """
-        # 1) todos os <p> imediatamente sob a seção "Effect"
         effect_ps = response.xpath(
             "//h2[normalize-space()='Effect']/"
             "following-sibling::*[preceding-sibling::h2[1][normalize-space()='Effect'] "
@@ -269,7 +252,6 @@ class PokeSpider(scrapy.Spider):
             if desc:
                 return desc
 
-        # 2) fallback: só o primeiro <p> depois de "Effect"
         effect_first_p = response.xpath(
             "(//h2[normalize-space()='Effect']/following-sibling::p)[1]//text()"
         ).getall()
@@ -277,13 +259,11 @@ class PokeSpider(scrapy.Spider):
         if desc:
             return desc
 
-        # 3) fallback: primeiro parágrafo do conteúdo principal
         first_p = response.xpath("(//article//p|//main//p|//div[@id='main']//p)[1]//text()").getall()
         desc = self._clean_text(" ".join(first_p))
         if desc:
             return desc
 
-        # 4) fallback: primeira célula da tabela de game descriptions
         game_td = response.xpath(
             "(//h2[contains(.,'Game descriptions')]/following-sibling::*//table"
             "[contains(@class,'vitals-table')]//tr[1]/td)[1]//text()"
@@ -293,7 +273,7 @@ class PokeSpider(scrapy.Spider):
 
     @staticmethod
     def _clean_text(text: str) -> str:
-        # remove múltiplos espaços/linhas e NBSP
+
         t = (text or "").replace("\xa0", " ")
         t = re.sub(r"\s+", " ", t).strip()
         return t
