@@ -1,83 +1,299 @@
 import scrapy
+import re
 
-# Exercício:
-# Buscar:
-# Nome, ID, Tamanho e Peso
-# Alguns dados estão dentro da página do Pokemon
-# Página do Pokémon deve usar o parser "parser_pokemon"
-
-# Dica: Principais CSS Selectors:
-# https://www.w3schools.com/cssref/css_selectors.php
 
 class PokeSpider(scrapy.Spider):
-  name = 'pokespider'
-  start_urls = ['https://pokemondb.net/pokedex/all']
+    name = "pokespider"
+    allowed_domains = ["pokemondb.net"]
+    start_urls = ["https://pokemondb.net/pokedex/all"]
 
-  def parse(self, response):
-    linhas = response.css('table#pokedex > tbody > tr')
-    for linha in linhas:
-      link = linha.css("td:nth-child(2) > a::attr(href)")
-      yield response.follow(link.get(), self.parser_pokemon)
-
-  def parser_pokemon(self, response):
-    id = response.css('table.vitals-table:first-of-type tr:nth-child(1) td strong::text').get()
-    nome = response.css('h1::text').get()
-    peso = response.css("th:contains('Weight') + td::text").get()
-    tamanho = response.css("th:contains('Height') + td::text").get()
-    habilidades = response.css("th:contains('Abilities') + td a::text").getall()
-    habilidades_str = ", ".join(habilidades)
-    urls_habilidades = [
-      response.urljoin(url) 
-      for url in response.css("th:contains('Abilities') + td a::attr(href)").getall()
-      ]
-    tipos = ",".join(response.css("th:contains('Type') + td a::text").getall())
-    url = response.url
-
-    evolucoes = []
-    cards = response.css("div.infocard-list-evo > *")
-    for i in range(0, len(cards), 2):
-        evo = cards[i] 
-        arrow = cards[i+1] if i+1 < len(cards) else None 
-
-        nome_evo = evo.css("a.ent-name::text").get()
-        url_evo = evo.css("a.ent-name::attr(href)").get()
-        poke_id_evo = evo.css("small::text").get()
-        tipos_evo = [t.get() for t in evo.css("small a.itype::text")]
-
-        level_item = arrow.css("small::text").get() if arrow else None
-        if level_item:
-            level_item = level_item.strip("()")
-
-        evolucoes.append({
-            "id": poke_id_evo,
-            "nome": nome_evo,
-            "url": response.urljoin(url_evo),
-            "tipos": tipos_evo,
-            "level_item": level_item
-        })
-      
-        efetividade = {}
-        tipos_ataque = response.css("table.type-table-pokedex tr:nth-child(1) th a::attr(title)").getall()
-        valores_celulas = response.css("table.type-table-pokedex tr:nth-child(2) td")
-
-        for i, tipo in enumerate(tipos_ataque):
-            celula = valores_celulas[i]
-            taxa = celula.css("::text").get()
-            if taxa is None or taxa.strip() == "":
-                taxa = ""
-            efetividade[tipo] = taxa
-
-
-    yield {
-        "id": id,
-        "url": url,
-        "nome": nome,
-        "tamanho": tamanho,
-        "peso": peso,
-        "tipos": tipos,
-        "habilidades":habilidades_str,
-        "url_habilidades":urls_habilidades,
-        "evolucoes":evolucoes,
-        "efetividade": efetividade
-
+    custom_settings = {
+        "USER_AGENT": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "AUTOTHROTTLE_ENABLED": True,
+        "AUTOTHROTTLE_START_DELAY": 0.5,
+        "AUTOTHROTTLE_MAX_DELAY": 10.0,
+        "DOWNLOAD_DELAY": 0.25,
+        "RANDOMIZE_DOWNLOAD_DELAY": True,
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        "RETRY_TIMES": 3,
     }
+
+    # ========== INDEX ==========
+    def parse(self, response):
+        for row in response.css("table#pokedex tbody tr"):
+            href = row.css("td.cell-name a.ent-name::attr(href)").get()
+            form_hint = (row.css("td.cell-name small.text-muted::text").get() or "Base").strip()
+            if href:
+                yield response.follow(
+                    href,
+                    callback=self.parse_pokemon,
+                    cb_kwargs={"form_hint": form_hint},
+                    dont_filter=True,  # visita mesmo URLs repetidas (uma por linha/forma)
+                )
+
+    # ========== POKÉMON DETALHE ==========
+    def parse_pokemon(self, response, form_hint):
+        url_pokemon = response.url
+        nome = (response.css("h1::text").get() or "").strip()
+
+        # vitals-table apenas de Pokédex data (tem "National")
+        pokedex_tables = response.xpath(
+            "//table[contains(@class,'vitals-table')][.//tr[th[contains(normalize-space(),'National')]]]"
+        )
+
+        # tenta casar por forma; fallback = primeira tabela de Pokédex data
+        table = None
+        for t in pokedex_tables:
+            small = t.xpath("normalize-space(preceding-sibling::h2[1]//small/text())").get()
+            h2txt = t.xpath("normalize-space(preceding-sibling::h2[1]/text())").get()
+            label = (small or h2txt or "").strip()
+            if self._match_form(label, form_hint):
+                table = t
+                break
+        if table is None and pokedex_tables:
+            table = pokedex_tables[0]
+
+        # básicos
+        if table is not None:
+            num_nat = table.xpath(
+                ".//tr[th[contains(normalize-space(),'National')]]/td//strong/text()"
+            ).get()
+            num_nat = (num_nat or "").strip()
+
+            tamanho = (table.xpath(".//tr[th[normalize-space()='Height']]/td/text()").get() or "").strip()
+            peso    = (table.xpath(".//tr[th[normalize-space()='Weight']]/td/text()").get() or "").strip()
+
+            tipos_list = table.xpath(".//tr[th[normalize-space()='Type']]/td//a/text()").getall()
+            tipos = ", ".join([t.strip() for t in tipos_list])
+        else:
+            num_nat, tamanho, peso, tipos = "", "", "", ""
+
+        # efetividade robusta
+        efetividade = self._extract_effectiveness(response)
+
+        # próximas evoluções (apenas depois do atual)
+        proximas_evolucoes = self._next_evolutions(response, nome)
+
+        # habilidades (link + descrição)
+        hab_nomes = table.xpath(".//tr[th[normalize-space()='Abilities']]/td//a/text()").getall() if table is not None else []
+        hab_urls = [response.urljoin(u) for u in table.xpath(
+            ".//tr[th[normalize-space()='Abilities']]/td//a/@href"
+        ).getall()] if table is not None else []
+
+        item = {
+            "numero": num_nat,
+            "url": url_pokemon,
+            "nome": nome,
+            "proximas_evolucoes": proximas_evolucoes,
+            "tamanho": tamanho,
+            "peso": peso,
+            "tipos": tipos,
+            "efetividade": efetividade,
+            "habilidades": [],
+        }
+
+        if not hab_urls:
+            yield item
+            return
+
+        item["_pending"] = len(hab_urls)
+        for n, u in zip(hab_nomes, hab_urls):
+            yield scrapy.Request(
+                u,
+                callback=self.parse_ability,
+                errback=self.parse_ability_error,
+                cb_kwargs={"item": item, "hab_nome": n},
+                dont_filter=True,
+            )
+
+    # ========== HABILIDADE ==========
+    def parse_ability(self, response, item, hab_nome):
+        descricao = self._extract_ability_description(response)
+        item["habilidades"].append({
+            "url": response.url,
+            "nome": (hab_nome or "").strip(),
+            "descricao": descricao,
+        })
+
+        item["_pending"] -= 1
+        if item["_pending"] == 0:
+            item.pop("_pending", None)
+            yield item
+
+    def parse_ability_error(self, failure):
+        req = failure.request
+        item = req.cb_kwargs["item"]
+        hab_nome = req.cb_kwargs.get("hab_nome", "")
+
+        item["habilidades"].append({
+            "url": req.url,
+            "nome": (hab_nome or "").strip(),
+            "descricao": "Falha ao obter descrição",
+        })
+
+        item["_pending"] -= 1
+        if item["_pending"] == 0:
+            item.pop("_pending", None)
+            yield item
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _match_form(label, form_hint):
+        """Compara 'Attack Forme' vs 'Attack Form', ignora caixa/hífens."""
+        def norm(s):
+            return (s or "").lower().replace("forme", "form").replace("-", " ").strip()
+        L, F = norm(label), norm(form_hint)
+        if F in ("", "base"):
+            return L in ("", "base", "pokédex data")
+        return F in L or L in F
+
+    def _next_evolutions(self, response, nome_atual):
+        """Retorna evoluções após o Pokémon atual."""
+        cards = response.css("div.infocard-list-evo > *")  # alterna: card, seta, card...
+        seq = []
+        for i in range(0, len(cards), 2):
+            card = cards[i]
+            arrow = cards[i + 1] if i + 1 < len(cards) else None
+
+            nome = card.css("a.ent-name::text").get()
+            url  = card.css("a.ent-name::attr(href)").get()
+            num  = card.css("small::text").get()
+            tipos = card.css("small a.itype::text").getall()
+
+            step = {
+                "numero": num,
+                "nome": nome,
+                "url": response.urljoin(url) if url else None,
+                "tipos": tipos,
+                "level_item": None,
+            }
+            if arrow is not None:
+                txt = arrow.css("small::text").get()
+                if txt:
+                    step["level_item"] = txt.strip("()")
+            seq.append(step)
+
+        # posição do atual
+        idx = None
+        for i, s in enumerate(seq):
+            if s["nome"] and nome_atual and s["nome"].strip().lower() == nome_atual.strip().lower():
+                idx = i
+                break
+        if idx is None:
+            return []
+
+        # só o que vem depois
+        proximos = []
+        for j in range(idx + 1, len(seq)):
+            s = seq[j]
+            proximos.append({
+                "numero": s["numero"],
+                "level": s["level_item"],
+                "item": None,
+                "nome": s["nome"],
+                "url": s["url"],
+            })
+        return proximos
+
+    # -------- efetividade (robusto) --------
+    def _extract_effectiveness(self, response):
+        table = self._find_effectiveness_table(response)
+        if not table:
+            return {}
+
+        # headers
+        headers = table.xpath(".//thead//th[not(contains(@class,'cell-total'))]")
+        if not headers:
+            headers = table.xpath(".//tr[1]/th[not(contains(@class,'cell-total'))]")
+
+        tipos = []
+        for th in headers:
+            t = th.xpath("normalize-space(a/text())").get()
+            if not t:
+                t = th.xpath("normalize-space(a/@title)").get()
+            if not t:
+                t = th.xpath("normalize-space(img/@alt)").get()
+            if t:
+                t = t.replace(" type", "").strip()
+            if t:
+                tipos.append(t)
+
+        # valores (primeira linha)
+        cells = table.xpath(".//tbody/tr[1]/td")
+        if not cells:
+            cells = table.xpath(".//tr[position()=2]/td")
+
+        efetividade = {}
+        for i, tipo in enumerate(tipos):
+            if i >= len(cells):
+                break
+            val = (cells[i].xpath("normalize-space(text())").get() or "").strip()
+            efetividade[tipo] = val if val else "1"
+        return efetividade
+
+    def _find_effectiveness_table(self, response):
+        cand = response.xpath("//table[contains(@class,'type-table-pokedex')]")
+        if cand:
+            return cand[0]
+        cand = response.xpath(
+            "(//h2[contains(.,'Type defenses') or contains(.,'Damage taken')]/following-sibling::div//table"
+            "[contains(@class,'type-table')])[1]"
+        )
+        if cand:
+            return cand[0]
+        cand = response.xpath("(//table[contains(@class,'type-table')])[1]")
+        return cand[0] if cand else None
+
+    # -------- habilidade: descrição (robusto) --------
+    def _extract_ability_description(self, response) -> str:
+        """
+        Prioriza a seção 'Effect' (um ou mais <p> até o próximo <h2>).
+        Fallback: primeiro <p> do conteúdo.
+        Fallback2: primeira célula da tabela 'Game descriptions'.
+        """
+        # 1) todos os <p> imediatamente sob a seção "Effect"
+        effect_ps = response.xpath(
+            "//h2[normalize-space()='Effect']/"
+            "following-sibling::*[preceding-sibling::h2[1][normalize-space()='Effect'] "
+            "and self::p]"
+        )
+        if effect_ps:
+            texts = []
+            for p in effect_ps:
+                texts.extend(p.xpath(".//text()").getall())
+            desc = self._clean_text(" ".join(texts))
+            if desc:
+                return desc
+
+        # 2) fallback: só o primeiro <p> depois de "Effect"
+        effect_first_p = response.xpath(
+            "(//h2[normalize-space()='Effect']/following-sibling::p)[1]//text()"
+        ).getall()
+        desc = self._clean_text(" ".join(effect_first_p))
+        if desc:
+            return desc
+
+        # 3) fallback: primeiro parágrafo do conteúdo principal
+        first_p = response.xpath("(//article//p|//main//p|//div[@id='main']//p)[1]//text()").getall()
+        desc = self._clean_text(" ".join(first_p))
+        if desc:
+            return desc
+
+        # 4) fallback: primeira célula da tabela de game descriptions
+        game_td = response.xpath(
+            "(//h2[contains(.,'Game descriptions')]/following-sibling::*//table"
+            "[contains(@class,'vitals-table')]//tr[1]/td)[1]//text()"
+        ).getall()
+        desc = self._clean_text(" ".join(game_td))
+        return desc if desc else "Descrição não encontrada"
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        # remove múltiplos espaços/linhas e NBSP
+        t = (text or "").replace("\xa0", " ")
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
